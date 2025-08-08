@@ -118,7 +118,7 @@ def update_gist(content):
     }
     
     # 建议：将文件名改为 .md 后缀，以便更好地被识别为 Markdown 文件
-    filename = "andrea_prompt.txt" # 您可以根据需要修改
+    filename = "andrea_prompt.md" # 您可以根据需要修改
     
     data = {
         "files": {
