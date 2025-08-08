@@ -8,52 +8,106 @@ NOTION_PAGE_ID = os.getenv('NOTION_PAGE_ID')
 GIST_ID = os.getenv('GIST_ID')
 GIST_TOKEN = os.getenv('GIST_TOKEN')
 
-# 定义请求头，后续重复使用
+# 定义请求头
 HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28"
 }
 
-def get_block_children_recursive(block_id):
+def rich_text_to_markdown(rich_text_array):
     """
-    递归函数，用于获取一个 block 下的所有子 block 内容。
-    这是解决同步区块问题的关键。
+    将 Notion 的 rich_text 数组转换为 Markdown 字符串。
+    支持：加粗、斜体、删除线、行内代码、链接。
     """
-    all_text = ""
-    url = f"https://api.notion.com/v1/blocks/{block_id}/children"
+    md_string = ""
+    for part in rich_text_array:
+        content = part.get("plain_text", "")
+        annotations = part.get("annotations", {})
+        
+        if annotations.get("bold"):
+            content = f"**{content}**"
+        if annotations.get("italic"):
+            content = f"*{content}*"
+        if annotations.get("strikethrough"):
+            content = f"~~{content}~~"
+        if annotations.get("code"):
+            content = f"`{content}`"
+            
+        if part.get("href"):
+            content = f"[{content}]({part.get('href')})"
+            
+        md_string += content
+    return md_string
+
+def block_to_markdown_recursive(block_id):
+    """
+    递归函数，将 block 及其子 block 转换为 Markdown。
+    核心升级：1. 支持分页。 2. 转换为 Markdown。
+    """
+    all_markdown = ""
+    start_cursor = None
     
-    try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
+    while True: # 循环处理分页
+        params = {}
+        if start_cursor:
+            params['start_cursor'] = start_cursor
+            
+        url = f"https://api.notion.com/v1/blocks/{block_id}/children"
+        response = requests.get(url, headers=HEADERS, params=params)
+        
+        if not response.ok:
+            print(f"Error fetching block children for {block_id}: {response.status_code} - {response.text}")
+            break
+
         data = response.json()
 
         for block in data.get("results", []):
-            # 1. 如果是同步区块，则获取其源头区块的内容
-            if block['type'] == 'synced_block':
-                # 检查 synced_from 是否为 None，如果是 None，说明这是原始区块
+            block_type = block.get("type")
+            
+            # --- 区块类型到 Markdown 的转换 ---
+            if block_type == 'paragraph':
+                rich_text = block.get("paragraph", {}).get("rich_text", [])
+                if rich_text: # 避免空段落产生多余换行
+                    all_markdown += rich_text_to_markdown(rich_text) + "\n\n"
+            elif block_type == 'heading_1':
+                all_markdown += f"# {rich_text_to_markdown(block['heading_1']['rich_text'])}\n\n"
+            elif block_type == 'heading_2':
+                all_markdown += f"## {rich_text_to_markdown(block['heading_2']['rich_text'])}\n\n"
+            elif block_type == 'heading_3':
+                all_markdown += f"### {rich_text_to_markdown(block['heading_3']['rich_text'])}\n\n"
+            elif block_type == 'bulleted_list_item':
+                all_markdown += f"- {rich_text_to_markdown(block['bulleted_list_item']['rich_text'])}\n"
+            elif block_type == 'numbered_list_item':
+                all_markdown += f"1. {rich_text_to_markdown(block['numbered_list_item']['rich_text'])}\n"
+            elif block_type == 'to_do':
+                checked = block['to_do']['checked']
+                prefix = "- [x]" if checked else "- [ ]"
+                all_markdown += f"{prefix} {rich_text_to_markdown(block['to_do']['rich_text'])}\n"
+            elif block_type == 'quote':
+                all_markdown += f"> {rich_text_to_markdown(block['quote']['rich_text'])}\n\n"
+            elif block_type == 'code':
+                language = block['code']['language']
+                code_text = rich_text_to_markdown(block['code']['rich_text'])
+                all_markdown += f"```{language}\n{code_text}\n```\n\n"
+            elif block_type == 'divider':
+                all_markdown += "---\n\n"
+            elif block_type == 'image':
+                img_url = block.get('image', {}).get('file', {}).get('url', '')
+                if img_url:
+                    all_markdown += f"![image]({img_url})\n\n"
+            elif block_type == 'synced_block':
                 synced_from = block['synced_block']['synced_from']
-                source_block_id = block['id'] if synced_from is None else synced_from['block_id']
-                all_text += get_block_children_recursive(source_block_id)
-
-            # 2. 如果是其他包含文本的区块，直接提取文本
-            elif block['type'] in ["paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item", "numbered_list_item", "to_do", "toggle", "quote", "callout"]:
-                text_parts = block[block['type']].get("rich_text", [])
-                for part in text_parts:
-                    all_text += part.get("plain_text", "")
-                all_text += "\n"
-
-    except requests.HTTPError as e:
-        print(f"Error fetching block children for {block_id}: {e}")
-        # 即使某个 block 获取失败，也继续执行
+                source_id = block['id'] if synced_from is None else synced_from['block_id']
+                all_markdown += block_to_markdown_recursive(source_id)
         
-    return all_text
-
-
-def get_notion_page_content():
-    """主函数，从顶层页面开始获取内容"""
-    return get_block_children_recursive(NOTION_PAGE_ID)
-
+        # 处理分页
+        if data.get("has_more"):
+            start_cursor = data.get("next_cursor")
+        else:
+            break
+            
+    return all_markdown
 
 def update_gist(content):
     """更新 GitHub Gist 的内容"""
@@ -63,15 +117,13 @@ def update_gist(content):
         "Accept": "application/vnd.github.v3+json"
     }
     
-    # ------------------------------------------------------------------
-    # 重要：请将这里的文件名修改为您 Gist 中的实际文件名！
-    # ------------------------------------------------------------------
-    filename = "andrea_prompt.txt" 
+    # 建议：将文件名改为 .md 后缀，以便更好地被识别为 Markdown 文件
+    filename = "andrea_prompt.md" # 您可以根据需要修改
     
     data = {
         "files": {
             filename: {
-                "content": content if content.strip() else " " # 如果内容为空，则传入一个空格以避免删除文件
+                "content": content if content.strip() else " "
             }
         }
     }
@@ -80,19 +132,20 @@ def update_gist(content):
     response.raise_for_status()
     print(f"Gist updated successfully! Status code: {response.status_code}")
 
-
 if __name__ == "__main__":
-    print("Starting Notion to Gist sync...")
+    print("Starting Notion to Gist sync (Markdown Edition)...")
     try:
-        notion_content = get_notion_page_content()
-        if notion_content:
-            print(f"Successfully fetched {len(notion_content)} characters from Notion.")
-            update_gist(notion_content)
+        markdown_content = block_to_markdown_recursive(NOTION_PAGE_ID)
+        if markdown_content:
+            print(f"Successfully fetched and converted {len(markdown_content)} characters to Markdown.")
+            update_gist(markdown_content)
             print("Sync completed.")
         else:
             print("No content found or fetched from Notion page. Updating Gist with empty content.")
-            update_gist("") # 如果 Notion 页面为空，也同步空内容到 Gist
+            update_gist("")
             
     except Exception as e:
         print(f"An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
         exit(1)
